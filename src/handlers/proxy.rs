@@ -143,7 +143,7 @@ async fn select_producer(state: &AppState, target_nf_type: &str) -> Result<Strin
         )));
     }
 
-    let selected = instances[0].clone();
+    let selected = state.load_balancer.select_round_robin(target_nf_type, &instances).clone();
 
     state.nf_profile_cache.insert(
         cache_key,

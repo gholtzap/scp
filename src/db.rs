@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use crate::config::Config;
 use crate::types::{AppState, CachedNfProfile};
+use crate::services::load_balancer::LoadBalancer;
 
 pub async fn init(config: &Config) -> anyhow::Result<AppState> {
     let client = Client::with_uri_str(&config.mongodb_uri).await?;
@@ -29,11 +30,14 @@ pub async fn init(config: &Config) -> anyhow::Result<AppState> {
 
     let nf_instance_id = uuid::Uuid::parse_str(&config.nf_instance_id)?;
 
+    let load_balancer = LoadBalancer::new();
+
     Ok(AppState {
         nf_instance_id,
         nrf_client,
         http_client,
         nf_profile_cache,
+        load_balancer,
     })
 }
 
