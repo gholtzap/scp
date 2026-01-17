@@ -39,6 +39,7 @@ pub struct Config {
     pub oauth2: OAuth2Config,
     pub tls: TlsConfig,
     pub cache_ttl_seconds: u64,
+    pub heartbeat_interval_seconds: u64,
 }
 
 impl Config {
@@ -63,6 +64,10 @@ impl Config {
 
         let cache_ttl_seconds = env::var("CACHE_TTL_SECONDS")
             .unwrap_or_else(|_| "300".to_string())
+            .parse()?;
+
+        let heartbeat_interval_seconds = env::var("HEARTBEAT_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "30".to_string())
             .parse()?;
 
         let oauth2_enabled = env::var("OAUTH2_ENABLED")
@@ -117,6 +122,7 @@ impl Config {
             oauth2,
             tls,
             cache_ttl_seconds,
+            heartbeat_interval_seconds,
         })
     }
 }

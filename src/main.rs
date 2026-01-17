@@ -9,9 +9,29 @@ mod middleware;
 mod routes;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::signal;
+use std::time::Duration;
+
+async fn heartbeat_task(
+    nrf_client: Arc<clients::nrf::NrfClient>,
+    profile: types::NfProfile,
+    interval_seconds: u64,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds));
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        match nrf_client.heartbeat(&profile).await {
+            Ok(_) => tracing::debug!("Heartbeat sent to NRF"),
+            Err(e) => tracing::warn!("Failed to send heartbeat to NRF: {}", e),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -44,6 +64,13 @@ async fn main() -> anyhow::Result<()> {
             Ok(_) => tracing::info!("Successfully registered with NRF"),
             Err(e) => tracing::error!("Failed to register with NRF: {}", e),
         }
+
+        let heartbeat_client = nrf_client.clone();
+        let heartbeat_profile = profile.clone();
+        let heartbeat_interval = config.heartbeat_interval_seconds;
+        tokio::spawn(async move {
+            heartbeat_task(heartbeat_client, heartbeat_profile, heartbeat_interval).await;
+        });
     }
 
     let app = routes::create_routes(state)

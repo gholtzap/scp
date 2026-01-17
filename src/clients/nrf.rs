@@ -19,6 +19,7 @@ pub struct SearchResult {
     pub nf_instances: Vec<NfProfile>,
 }
 
+#[derive(Clone)]
 pub struct NrfClient {
     client: Client,
     nrf_uri: String,
@@ -121,6 +122,39 @@ impl NrfClient {
                 let error_body = response.text().await.unwrap_or_default();
                 Err(anyhow::anyhow!(
                     "NRF deregistration failed with status {}: {}",
+                    status,
+                    error_body
+                ))
+            }
+        }
+    }
+
+    pub async fn heartbeat(&self, profile: &NfProfile) -> Result<()> {
+        let url = format!(
+            "{}/nnrf-nfm/v1/nf-instances/{}",
+            self.nrf_uri, profile.nf_instance_id
+        );
+
+        let response = self
+            .client
+            .patch(&url)
+            .json(profile)
+            .send()
+            .await
+            .context("Failed to send heartbeat request to NRF")?;
+
+        match response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::CREATED => {
+                tracing::debug!(
+                    "Heartbeat sent successfully for NF instance {}",
+                    profile.nf_instance_id
+                );
+                Ok(())
+            }
+            status => {
+                let error_body = response.text().await.unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "NRF heartbeat failed with status {}: {}",
                     status,
                     error_body
                 ))
