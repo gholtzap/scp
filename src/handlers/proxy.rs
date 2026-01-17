@@ -25,7 +25,7 @@ pub async fn proxy_request(
 
     tracing::debug!("Extracted target NF type: {}", target_nf_type);
 
-    let producer_uri = select_producer(&state, &target_nf_type).await?;
+    let (producer_uri, _connection_guard) = select_producer(&state, &target_nf_type).await?;
 
     tracing::info!(
         "Forwarding {} {} to producer at {}",
@@ -107,14 +107,21 @@ fn extract_nf_type_from_path(path: &str) -> Option<String> {
     Some(nf_type)
 }
 
-async fn select_producer(state: &AppState, target_nf_type: &str) -> Result<String, AppError> {
+async fn select_producer(
+    state: &AppState,
+    target_nf_type: &str,
+) -> Result<(String, crate::services::load_balancer::ConnectionGuard), AppError> {
     let cache_key = format!("nf_type_{}", target_nf_type);
 
     if let Some(cached) = state.nf_profile_cache.get(&cache_key) {
         let cache_age = chrono::Utc::now() - cached.cached_at;
         if cache_age.num_seconds() < 300 {
             tracing::debug!("Using cached NF profile for {}", target_nf_type);
-            return build_producer_uri(&cached.profile);
+            let uri = build_producer_uri(&cached.profile)?;
+            let guard = state
+                .load_balancer
+                .acquire_connection(cached.profile.nf_instance_id.clone());
+            return Ok((uri, guard));
         }
     }
 
@@ -143,7 +150,7 @@ async fn select_producer(state: &AppState, target_nf_type: &str) -> Result<Strin
         )));
     }
 
-    let selected = state.load_balancer.select_round_robin(target_nf_type, &instances).clone();
+    let selected = state.load_balancer.select_least_connections(&instances).clone();
 
     state.nf_profile_cache.insert(
         cache_key,
@@ -153,7 +160,12 @@ async fn select_producer(state: &AppState, target_nf_type: &str) -> Result<Strin
         },
     );
 
-    build_producer_uri(&selected)
+    let uri = build_producer_uri(&selected)?;
+    let guard = state
+        .load_balancer
+        .acquire_connection(selected.nf_instance_id.clone());
+
+    Ok((uri, guard))
 }
 
 fn build_producer_uri(profile: &crate::types::NfProfile) -> Result<String, AppError> {
