@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let state = db::init(&config).await?;
 
     if let Some(ref nrf_client) = state.nrf_client {
-        let profile = clients::nrf::NfProfile {
+        let profile = types::NfProfile {
             nf_instance_id: state.nf_instance_id.to_string(),
             nf_type: "SCP".to_string(),
             nf_status: "REGISTERED".to_string(),
