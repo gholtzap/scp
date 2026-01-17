@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use crate::types::NfProfile;
+use rand::Rng;
 
 pub struct LoadBalancer {
     round_robin_index: Arc<DashMap<String, usize>>,
@@ -53,6 +54,38 @@ impl LoadBalancer {
             .expect("instances is not empty");
 
         selected
+    }
+
+    pub fn select_weighted<'a>(&self, instances: &'a [NfProfile]) -> &'a NfProfile {
+        if instances.is_empty() {
+            panic!("Cannot select from empty instances list");
+        }
+
+        if instances.len() == 1 {
+            return &instances[0];
+        }
+
+        let total_capacity: u32 = instances
+            .iter()
+            .map(|instance| instance.capacity.unwrap_or(100))
+            .sum();
+
+        if total_capacity == 0 {
+            return &instances[0];
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut random_value = rng.gen_range(0..total_capacity);
+
+        for instance in instances {
+            let capacity = instance.capacity.unwrap_or(100);
+            if random_value < capacity {
+                return instance;
+            }
+            random_value -= capacity;
+        }
+
+        &instances[instances.len() - 1]
     }
 
     pub fn increment_connections(&self, nf_instance_id: &str) {
