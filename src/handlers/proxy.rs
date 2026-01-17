@@ -30,106 +30,124 @@ pub async fn proxy_request(
 
     let session_id = addr.ip().to_string();
 
-    let (producer_uri, selected_instance_id, _connection_guard) = select_producer(&state, &target_nf_type, &session_id).await?;
-
-    tracing::info!(
-        "Forwarding {} {} to producer at {}",
-        method,
-        path,
-        producer_uri
-    );
-
-    let target_url = if let Some(q) = query {
-        format!("{}{}?{}", producer_uri, path, q)
-    } else {
-        format!("{}{}", producer_uri, path)
-    };
-
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to read request body: {}", e)))?;
 
-    let retry_result = retry_with_backoff(&state.retry_config, || {
-        let state = state.clone();
-        let target_url = target_url.clone();
-        let method = method.clone();
-        let headers = headers.clone();
-        let body_bytes = body_bytes.clone();
-        let selected_instance_id = selected_instance_id.clone();
+    let available_producers = discover_producers(&state, &target_nf_type).await?;
+    let mut excluded_instances = Vec::new();
 
-        async move {
-            let mut request_builder = state
-                .http_client
-                .request(method, &target_url);
-
-            for (key, value) in headers.iter() {
-                if !is_hop_by_hop_header(key.as_str()) {
-                    request_builder = request_builder.header(key, value);
+    for attempt in 0..available_producers.len() {
+        let (producer_uri, selected_instance_id, _connection_guard) =
+            match select_next_producer(&state, &target_nf_type, &session_id, &available_producers, &excluded_instances) {
+                Ok(producer) => producer,
+                Err(e) => {
+                    tracing::error!("No more producers available to try: {}", e);
+                    return Err(e);
                 }
+            };
+
+        tracing::info!(
+            "Forwarding {} {} to producer at {} (attempt {}/{})",
+            method,
+            path,
+            producer_uri,
+            attempt + 1,
+            available_producers.len()
+        );
+
+        let target_url = if let Some(q) = query {
+            format!("{}{}?{}", producer_uri, path, q)
+        } else {
+            format!("{}{}", producer_uri, path)
+        };
+
+        let retry_result = retry_with_backoff(&state.retry_config, || {
+            let state = state.clone();
+            let target_url = target_url.clone();
+            let method = method.clone();
+            let headers = headers.clone();
+            let body_bytes = body_bytes.clone();
+            let selected_instance_id = selected_instance_id.clone();
+
+            async move {
+                let mut request_builder = state
+                    .http_client
+                    .request(method, &target_url);
+
+                for (key, value) in headers.iter() {
+                    if !is_hop_by_hop_header(key.as_str()) {
+                        request_builder = request_builder.header(key, value);
+                    }
+                }
+
+                if !body_bytes.is_empty() {
+                    request_builder = request_builder.body(body_bytes);
+                }
+
+                let response = request_builder.send().await.map_err(|e| {
+                    AppError::ServiceUnavailable(format!("Request failed: {}", e))
+                })?;
+
+                let status = response.status();
+
+                if status.is_server_error() || status == StatusCode::SERVICE_UNAVAILABLE {
+                    tracing::warn!(
+                        "Producer {} returned error status {}, will retry",
+                        selected_instance_id,
+                        status
+                    );
+                    return Err(AppError::ServiceUnavailable(format!(
+                        "Producer returned error status: {}",
+                        status
+                    )));
+                }
+
+                Ok(response)
             }
+        })
+        .await;
 
-            if !body_bytes.is_empty() {
-                request_builder = request_builder.body(body_bytes);
+        match retry_result {
+            Ok(response) => {
+                let status = response.status();
+                state.load_balancer.mark_success(&selected_instance_id);
+
+                let response_headers = response.headers().clone();
+                let response_body = response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::InternalError(format!("Failed to read response body: {}", e)))?;
+
+                let mut builder = Response::builder().status(status);
+
+                for (key, value) in response_headers.iter() {
+                    if !is_hop_by_hop_header(key.as_str()) {
+                        builder = builder.header(key, value);
+                    }
+                }
+
+                let response = builder
+                    .body(Body::from(response_body))
+                    .map_err(|e| AppError::InternalError(format!("Failed to build response: {}", e)))?;
+
+                return Ok(response);
             }
-
-            let response = request_builder.send().await.map_err(|e| {
-                AppError::ServiceUnavailable(format!("Request failed: {}", e))
-            })?;
-
-            let status = response.status();
-
-            if status.is_server_error() || status == StatusCode::SERVICE_UNAVAILABLE {
+            Err(e) => {
+                state.load_balancer.mark_failure(&selected_instance_id);
                 tracing::warn!(
-                    "Producer {} returned error status {}, will retry",
+                    "Producer {} failed after retries: {}. Trying next producer...",
                     selected_instance_id,
-                    status
+                    e
                 );
-                return Err(AppError::ServiceUnavailable(format!(
-                    "Producer returned error status: {}",
-                    status
-                )));
+                excluded_instances.push(selected_instance_id);
             }
-
-            Ok(response)
-        }
-    })
-    .await;
-
-    match retry_result {
-        Ok(response) => {
-            let status = response.status();
-            state.load_balancer.mark_success(&selected_instance_id);
-
-            let response_headers = response.headers().clone();
-            let response_body = response
-                .bytes()
-                .await
-                .map_err(|e| AppError::InternalError(format!("Failed to read response body: {}", e)))?;
-
-            let mut builder = Response::builder().status(status);
-
-            for (key, value) in response_headers.iter() {
-                if !is_hop_by_hop_header(key.as_str()) {
-                    builder = builder.header(key, value);
-                }
-            }
-
-            let response = builder
-                .body(Body::from(response_body))
-                .map_err(|e| AppError::InternalError(format!("Failed to build response: {}", e)))?;
-
-            Ok(response)
-        }
-        Err(e) => {
-            state.load_balancer.mark_failure(&selected_instance_id);
-            tracing::error!(
-                "Failed to forward request to producer {} after retries: {}",
-                selected_instance_id,
-                e
-            );
-            Err(e)
         }
     }
+
+    Err(AppError::ServiceUnavailable(
+        "All available producers failed to handle the request".to_string(),
+    ))
 }
 
 fn extract_nf_type_from_path(path: &str) -> Option<String> {
@@ -154,12 +172,11 @@ fn extract_nf_type_from_path(path: &str) -> Option<String> {
     Some(nf_type)
 }
 
-async fn select_producer(
+async fn discover_producers(
     state: &AppState,
     target_nf_type: &str,
-    session_id: &str,
-) -> Result<(String, String, crate::services::load_balancer::ConnectionGuard), AppError> {
-    tracing::debug!("Cache miss or expired for {}, querying NRF", target_nf_type);
+) -> Result<Vec<crate::types::NfProfile>, AppError> {
+    tracing::debug!("Querying NRF for {}", target_nf_type);
 
     let nrf_client = state
         .nrf_client
@@ -184,9 +201,31 @@ async fn select_producer(
         )));
     }
 
+    Ok(instances)
+}
+
+fn select_next_producer(
+    state: &AppState,
+    target_nf_type: &str,
+    session_id: &str,
+    instances: &[crate::types::NfProfile],
+    excluded_instances: &[String],
+) -> Result<(String, String, crate::services::load_balancer::ConnectionGuard), AppError> {
+    let available_instances: Vec<_> = instances
+        .iter()
+        .filter(|i| !excluded_instances.contains(&i.nf_instance_id))
+        .cloned()
+        .collect();
+
+    if available_instances.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "No more available producer instances to try".to_string(),
+        ));
+    }
+
     let selected = state
         .load_balancer
-        .select_with_sticky_session(session_id, target_nf_type, &instances)
+        .select_with_sticky_session(session_id, target_nf_type, &available_instances)
         .clone();
 
     let uri = build_producer_uri(&selected)?;
