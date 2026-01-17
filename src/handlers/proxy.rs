@@ -25,7 +25,7 @@ pub async fn proxy_request(
 
     tracing::debug!("Extracted target NF type: {}", target_nf_type);
 
-    let (producer_uri, _connection_guard) = select_producer(&state, &target_nf_type).await?;
+    let (producer_uri, selected_instance_id, _connection_guard) = select_producer(&state, &target_nf_type).await?;
 
     tracing::info!(
         "Forwarding {} {} to producer at {}",
@@ -58,31 +58,53 @@ pub async fn proxy_request(
         request_builder = request_builder.body(body_bytes);
     }
 
-    let response = request_builder
-        .send()
-        .await
-        .map_err(|e| AppError::ServiceUnavailable(format!("Failed to forward request: {}", e)))?;
+    let response_result = request_builder.send().await;
 
-    let status = response.status();
-    let response_headers = response.headers().clone();
-    let response_body = response
-        .bytes()
-        .await
-        .map_err(|e| AppError::InternalError(format!("Failed to read response body: {}", e)))?;
+    match response_result {
+        Ok(response) => {
+            let status = response.status();
 
-    let mut builder = Response::builder().status(status);
+            if status.is_server_error() || status == StatusCode::SERVICE_UNAVAILABLE {
+                state.load_balancer.mark_failure(&selected_instance_id);
+                tracing::warn!(
+                    "Producer {} returned error status {}, marked as unhealthy",
+                    selected_instance_id,
+                    status
+                );
+            } else {
+                state.load_balancer.mark_success(&selected_instance_id);
+            }
 
-    for (key, value) in response_headers.iter() {
-        if !is_hop_by_hop_header(key.as_str()) {
-            builder = builder.header(key, value);
+            let response_headers = response.headers().clone();
+            let response_body = response
+                .bytes()
+                .await
+                .map_err(|e| AppError::InternalError(format!("Failed to read response body: {}", e)))?;
+
+            let mut builder = Response::builder().status(status);
+
+            for (key, value) in response_headers.iter() {
+                if !is_hop_by_hop_header(key.as_str()) {
+                    builder = builder.header(key, value);
+                }
+            }
+
+            let response = builder
+                .body(Body::from(response_body))
+                .map_err(|e| AppError::InternalError(format!("Failed to build response: {}", e)))?;
+
+            Ok(response)
+        }
+        Err(e) => {
+            state.load_balancer.mark_failure(&selected_instance_id);
+            tracing::error!(
+                "Failed to forward request to producer {}: {}",
+                selected_instance_id,
+                e
+            );
+            Err(AppError::ServiceUnavailable(format!("Failed to forward request: {}", e)))
         }
     }
-
-    let response = builder
-        .body(Body::from(response_body))
-        .map_err(|e| AppError::InternalError(format!("Failed to build response: {}", e)))?;
-
-    Ok(response)
 }
 
 fn extract_nf_type_from_path(path: &str) -> Option<String> {
@@ -110,7 +132,7 @@ fn extract_nf_type_from_path(path: &str) -> Option<String> {
 async fn select_producer(
     state: &AppState,
     target_nf_type: &str,
-) -> Result<(String, crate::services::load_balancer::ConnectionGuard), AppError> {
+) -> Result<(String, String, crate::services::load_balancer::ConnectionGuard), AppError> {
     let cache_key = format!("nf_type_{}", target_nf_type);
 
     if let Some(cached) = state.nf_profile_cache.get(&cache_key) {
@@ -118,10 +140,11 @@ async fn select_producer(
         if cache_age.num_seconds() < 300 {
             tracing::debug!("Using cached NF profile for {}", target_nf_type);
             let uri = build_producer_uri(&cached.profile)?;
+            let instance_id = cached.profile.nf_instance_id.clone();
             let guard = state
                 .load_balancer
-                .acquire_connection(cached.profile.nf_instance_id.clone());
-            return Ok((uri, guard));
+                .acquire_connection(instance_id.clone());
+            return Ok((uri, instance_id, guard));
         }
     }
 
@@ -161,11 +184,12 @@ async fn select_producer(
     );
 
     let uri = build_producer_uri(&selected)?;
+    let instance_id = selected.nf_instance_id.clone();
     let guard = state
         .load_balancer
-        .acquire_connection(selected.nf_instance_id.clone());
+        .acquire_connection(instance_id.clone());
 
-    Ok((uri, guard))
+    Ok((uri, instance_id, guard))
 }
 
 fn build_producer_uri(profile: &crate::types::NfProfile) -> Result<String, AppError> {
