@@ -1,4 +1,5 @@
 use std::env;
+use crate::types::RetryConfig;
 
 #[derive(Debug, Clone)]
 pub struct OAuth2Config {
@@ -40,6 +41,7 @@ pub struct Config {
     pub tls: TlsConfig,
     pub cache_ttl_seconds: u64,
     pub heartbeat_interval_seconds: u64,
+    pub retry: RetryConfig,
 }
 
 impl Config {
@@ -112,6 +114,33 @@ impl Config {
             key_path: tls_key_path,
         };
 
+        let retry_max_attempts = env::var("RETRY_MAX_ATTEMPTS")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse()
+            .unwrap_or(3);
+
+        let retry_initial_backoff_ms = env::var("RETRY_INITIAL_BACKOFF_MS")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse()
+            .unwrap_or(100);
+
+        let retry_max_backoff_ms = env::var("RETRY_MAX_BACKOFF_MS")
+            .unwrap_or_else(|_| "5000".to_string())
+            .parse()
+            .unwrap_or(5000);
+
+        let retry_backoff_multiplier = env::var("RETRY_BACKOFF_MULTIPLIER")
+            .unwrap_or_else(|_| "2.0".to_string())
+            .parse()
+            .unwrap_or(2.0);
+
+        let retry = RetryConfig {
+            max_attempts: retry_max_attempts,
+            initial_backoff_ms: retry_initial_backoff_ms,
+            max_backoff_ms: retry_max_backoff_ms,
+            backoff_multiplier: retry_backoff_multiplier,
+        };
+
         Ok(Self {
             host,
             port,
@@ -123,6 +152,7 @@ impl Config {
             tls,
             cache_ttl_seconds,
             heartbeat_interval_seconds,
+            retry,
         })
     }
 }

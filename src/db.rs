@@ -38,6 +38,7 @@ pub async fn init(config: &Config) -> anyhow::Result<AppState> {
         http_client,
         nf_profile_cache,
         load_balancer,
+        retry_config: config.retry.clone(),
     })
 }
 

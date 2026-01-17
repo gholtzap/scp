@@ -7,6 +7,7 @@ use axum::{
 use std::net::SocketAddr;
 use crate::clients::nrf::NfDiscoveryParams;
 use crate::types::{AppError, AppState};
+use crate::utils::retry_with_backoff;
 
 pub async fn proxy_request(
     State(state): State<AppState>,
@@ -48,36 +49,56 @@ pub async fn proxy_request(
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to read request body: {}", e)))?;
 
-    let mut request_builder = state
-        .http_client
-        .request(method.clone(), &target_url);
+    let retry_result = retry_with_backoff(&state.retry_config, || {
+        let state = state.clone();
+        let target_url = target_url.clone();
+        let method = method.clone();
+        let headers = headers.clone();
+        let body_bytes = body_bytes.clone();
+        let selected_instance_id = selected_instance_id.clone();
 
-    for (key, value) in headers.iter() {
-        if !is_hop_by_hop_header(key.as_str()) {
-            request_builder = request_builder.header(key, value);
-        }
-    }
+        async move {
+            let mut request_builder = state
+                .http_client
+                .request(method, &target_url);
 
-    if !body_bytes.is_empty() {
-        request_builder = request_builder.body(body_bytes);
-    }
+            for (key, value) in headers.iter() {
+                if !is_hop_by_hop_header(key.as_str()) {
+                    request_builder = request_builder.header(key, value);
+                }
+            }
 
-    let response_result = request_builder.send().await;
+            if !body_bytes.is_empty() {
+                request_builder = request_builder.body(body_bytes);
+            }
 
-    match response_result {
-        Ok(response) => {
+            let response = request_builder.send().await.map_err(|e| {
+                AppError::ServiceUnavailable(format!("Request failed: {}", e))
+            })?;
+
             let status = response.status();
 
             if status.is_server_error() || status == StatusCode::SERVICE_UNAVAILABLE {
-                state.load_balancer.mark_failure(&selected_instance_id);
                 tracing::warn!(
-                    "Producer {} returned error status {}, marked as unhealthy",
+                    "Producer {} returned error status {}, will retry",
                     selected_instance_id,
                     status
                 );
-            } else {
-                state.load_balancer.mark_success(&selected_instance_id);
+                return Err(AppError::ServiceUnavailable(format!(
+                    "Producer returned error status: {}",
+                    status
+                )));
             }
+
+            Ok(response)
+        }
+    })
+    .await;
+
+    match retry_result {
+        Ok(response) => {
+            let status = response.status();
+            state.load_balancer.mark_success(&selected_instance_id);
 
             let response_headers = response.headers().clone();
             let response_body = response
@@ -102,11 +123,11 @@ pub async fn proxy_request(
         Err(e) => {
             state.load_balancer.mark_failure(&selected_instance_id);
             tracing::error!(
-                "Failed to forward request to producer {}: {}",
+                "Failed to forward request to producer {} after retries: {}",
                 selected_instance_id,
                 e
             );
-            Err(AppError::ServiceUnavailable(format!("Failed to forward request: {}", e)))
+            Err(e)
         }
     }
 }
