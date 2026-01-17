@@ -48,7 +48,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = routes::create_routes(state)
         .layer(TraceLayer::new_for_http())
-        .layer(tower_http::cors::CorsLayer::permissive());
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
 

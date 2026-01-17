@@ -23,12 +23,21 @@ impl Default for HealthStatus {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StickySession {
+    pub nf_instance_id: String,
+    pub nf_type: String,
+    pub created_at: Instant,
+}
+
 pub struct LoadBalancer {
     round_robin_index: Arc<DashMap<String, usize>>,
     connection_counts: Arc<DashMap<String, usize>>,
     health_status: Arc<DashMap<String, HealthStatus>>,
+    sticky_sessions: Arc<DashMap<String, StickySession>>,
     failure_threshold: usize,
     circuit_timeout: Duration,
+    session_ttl: Duration,
 }
 
 impl LoadBalancer {
@@ -37,9 +46,53 @@ impl LoadBalancer {
             round_robin_index: Arc::new(DashMap::new()),
             connection_counts: Arc::new(DashMap::new()),
             health_status: Arc::new(DashMap::new()),
+            sticky_sessions: Arc::new(DashMap::new()),
             failure_threshold: 3,
             circuit_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(300),
         }
+    }
+
+    pub fn get_sticky_session(&self, session_id: &str, nf_type: &str) -> Option<String> {
+        let now = Instant::now();
+
+        if let Some(session) = self.sticky_sessions.get(session_id) {
+            if session.nf_type == nf_type {
+                let age = now.duration_since(session.created_at);
+                if age < self.session_ttl {
+                    if self.get_health_status(&session.nf_instance_id) {
+                        return Some(session.nf_instance_id.clone());
+                    } else {
+                        tracing::debug!("Sticky session for {} expired due to unhealthy instance", session_id);
+                        self.sticky_sessions.remove(session_id);
+                    }
+                } else {
+                    tracing::debug!("Sticky session for {} expired (TTL exceeded)", session_id);
+                    self.sticky_sessions.remove(session_id);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn set_sticky_session(&self, session_id: &str, nf_instance_id: &str, nf_type: &str) {
+        let session = StickySession {
+            nf_instance_id: nf_instance_id.to_string(),
+            nf_type: nf_type.to_string(),
+            created_at: Instant::now(),
+        };
+
+        self.sticky_sessions.insert(session_id.to_string(), session);
+        tracing::debug!("Created sticky session: {} -> {}", session_id, nf_instance_id);
+    }
+
+    pub fn cleanup_expired_sessions(&self) {
+        let now = Instant::now();
+
+        self.sticky_sessions.retain(|_, session| {
+            now.duration_since(session.created_at) < self.session_ttl
+        });
     }
 
     pub fn filter_healthy<'a>(&self, instances: &'a [NfProfile]) -> Vec<&'a NfProfile> {
@@ -158,6 +211,39 @@ impl LoadBalancer {
         instances_to_use[instances_to_use.len() - 1]
     }
 
+    pub fn select_with_sticky_session<'a>(
+        &self,
+        session_id: &str,
+        nf_type: &str,
+        instances: &'a [NfProfile],
+    ) -> &'a NfProfile {
+        if instances.is_empty() {
+            panic!("Cannot select from empty instances list");
+        }
+
+        if let Some(sticky_instance_id) = self.get_sticky_session(session_id, nf_type) {
+            if let Some(instance) = instances
+                .iter()
+                .find(|i| i.nf_instance_id == sticky_instance_id)
+            {
+                tracing::debug!(
+                    "Using sticky session: {} -> {}",
+                    session_id,
+                    sticky_instance_id
+                );
+                return instance;
+            } else {
+                tracing::debug!("Sticky instance {} not in available instances", sticky_instance_id);
+                self.sticky_sessions.remove(session_id);
+            }
+        }
+
+        let selected = self.select_least_connections(instances);
+        self.set_sticky_session(session_id, &selected.nf_instance_id, nf_type);
+
+        selected
+    }
+
     pub fn increment_connections(&self, nf_instance_id: &str) {
         self.connection_counts
             .entry(nf_instance_id.to_string())
@@ -236,8 +322,10 @@ impl Clone for LoadBalancer {
             round_robin_index: Arc::clone(&self.round_robin_index),
             connection_counts: Arc::clone(&self.connection_counts),
             health_status: Arc::clone(&self.health_status),
+            sticky_sessions: Arc::clone(&self.sticky_sessions),
             failure_threshold: self.failure_threshold,
             circuit_timeout: self.circuit_timeout,
+            session_ttl: self.session_ttl,
         }
     }
 }

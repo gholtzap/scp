@@ -1,14 +1,16 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Request, State, ConnectInfo},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+use std::net::SocketAddr;
 use crate::clients::nrf::NfDiscoveryParams;
 use crate::types::{AppError, AppState};
 
 pub async fn proxy_request(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -25,7 +27,9 @@ pub async fn proxy_request(
 
     tracing::debug!("Extracted target NF type: {}", target_nf_type);
 
-    let (producer_uri, selected_instance_id, _connection_guard) = select_producer(&state, &target_nf_type).await?;
+    let session_id = addr.ip().to_string();
+
+    let (producer_uri, selected_instance_id, _connection_guard) = select_producer(&state, &target_nf_type, &session_id).await?;
 
     tracing::info!(
         "Forwarding {} {} to producer at {}",
@@ -132,22 +136,8 @@ fn extract_nf_type_from_path(path: &str) -> Option<String> {
 async fn select_producer(
     state: &AppState,
     target_nf_type: &str,
+    session_id: &str,
 ) -> Result<(String, String, crate::services::load_balancer::ConnectionGuard), AppError> {
-    let cache_key = format!("nf_type_{}", target_nf_type);
-
-    if let Some(cached) = state.nf_profile_cache.get(&cache_key) {
-        let cache_age = chrono::Utc::now() - cached.cached_at;
-        if cache_age.num_seconds() < 300 {
-            tracing::debug!("Using cached NF profile for {}", target_nf_type);
-            let uri = build_producer_uri(&cached.profile)?;
-            let instance_id = cached.profile.nf_instance_id.clone();
-            let guard = state
-                .load_balancer
-                .acquire_connection(instance_id.clone());
-            return Ok((uri, instance_id, guard));
-        }
-    }
-
     tracing::debug!("Cache miss or expired for {}, querying NRF", target_nf_type);
 
     let nrf_client = state
@@ -173,15 +163,10 @@ async fn select_producer(
         )));
     }
 
-    let selected = state.load_balancer.select_least_connections(&instances).clone();
-
-    state.nf_profile_cache.insert(
-        cache_key,
-        crate::types::CachedNfProfile {
-            profile: selected.clone(),
-            cached_at: chrono::Utc::now(),
-        },
-    );
+    let selected = state
+        .load_balancer
+        .select_with_sticky_session(session_id, target_nf_type, &instances)
+        .clone();
 
     let uri = build_producer_uri(&selected)?;
     let instance_id = selected.nf_instance_id.clone();
