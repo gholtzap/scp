@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use uuid::Uuid;
 use dashmap::DashMap;
+use std::time::Instant;
 use super::nf_profile::CachedNfProfile;
 use super::retry_config::RetryConfig;
 use crate::services::load_balancer::LoadBalancer;
@@ -13,4 +14,5 @@ pub struct AppState {
     pub nf_profile_cache: Arc<DashMap<String, CachedNfProfile>>,
     pub load_balancer: LoadBalancer,
     pub retry_config: RetryConfig,
+    pub start_time: Instant,
 }

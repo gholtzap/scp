@@ -39,6 +39,7 @@ pub async fn init(config: &Config) -> anyhow::Result<AppState> {
         nf_profile_cache,
         load_balancer,
         retry_config: config.retry.clone(),
+        start_time: std::time::Instant::now(),
     })
 }
 

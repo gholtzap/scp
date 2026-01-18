@@ -314,6 +314,51 @@ impl LoadBalancer {
             true
         }
     }
+
+    pub fn get_statistics(&self) -> LoadBalancerStats {
+        let now = Instant::now();
+
+        let total_connections: usize = self.connection_counts.iter().map(|entry| *entry.value()).sum();
+
+        let mut healthy_instances = 0;
+        let mut unhealthy_instances = 0;
+        let mut circuit_open_instances = 0;
+
+        for entry in self.health_status.iter() {
+            let health = entry.value();
+            if let Some(circuit_open_until) = health.circuit_open_until {
+                if now < circuit_open_until {
+                    circuit_open_instances += 1;
+                    unhealthy_instances += 1;
+                    continue;
+                }
+            }
+            if health.is_healthy {
+                healthy_instances += 1;
+            } else {
+                unhealthy_instances += 1;
+            }
+        }
+
+        let active_sticky_sessions = self.sticky_sessions.len();
+
+        LoadBalancerStats {
+            total_connections,
+            healthy_instances,
+            unhealthy_instances,
+            circuit_open_instances,
+            active_sticky_sessions,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LoadBalancerStats {
+    pub total_connections: usize,
+    pub healthy_instances: usize,
+    pub unhealthy_instances: usize,
+    pub circuit_open_instances: usize,
+    pub active_sticky_sessions: usize,
 }
 
 impl Clone for LoadBalancer {
